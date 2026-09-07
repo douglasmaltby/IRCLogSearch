@@ -10,6 +10,7 @@
 //  UI for selecting channels, sorting, filtering is not ideal yet.
 //  Sort on columns, ability to select and copy records to clipboard
 //  Facets - rather than just one search box - use facets on the top or left side, i.e. Channels (with checkboxes), date range, users (with checkboxes), message content
+//  9/7/26 - Performance & efficiency. I had my new Hermes bots review the Swift code with Ornith 1.5 35B A3b using my @librarian, @ai-researcher and @orchestrator bots and they found a couple high impact performance gains. 1) it was filtering on each and every keystroke, so there's now a wait of 150ms. Seems this called "debounce". See findings in Obsidian here: /Users/douglasmaltby/Documents/Obsidian/Obsidian Vault/Douglas @ Home/0. AI/Code/IRCLogSearch-Performance-Review.md
 
 import AppKit
 import SwiftUI
@@ -247,14 +248,12 @@ class LogSearchModel {
         updateFilter()
     }
 
-    /// Filters search and channel results concurrently across CPU cores
+    /// Filters search and channel results on a single background task (fast for small folders).
     func updateFilter() {
-        // Cancel previous tasks so rapid typing doesn't hang the app
         filterTask?.cancel()
         sortTask?.cancel()
-        isSearching = true
 
-        // Capture value types to avoid retaining the non-Sendable @MainActor class in Task.detached
+        // Debounce: coalesce rapid keystrokes into ONE scan.
         let search = searchText.lowercased()
         let selected = selectedChannels
         let entries = allEntries
@@ -262,89 +261,46 @@ class LogSearchModel {
         let currentSort = sortOrder
 
         filterTask = Task {
-            let (filtered, sorted) = await Task.detached(priority: .userInitiated) {
-                if selected.isEmpty { return ([LogEntry](), [LogEntry]()) }
+            try? await Task.sleep(for: .milliseconds(150)) // debounce window
+            if Task.isCancelled { return }
 
-                let checkChannels = selected.count < totalChannelsCount
-                let checkSearch = !search.isEmpty
+            self.isSearching = true
+            defer { self.isSearching = false }
 
-                // If there are no active filters, instantly return the pre-sorted massive array
-                if !checkChannels && !checkSearch {
-                    var sortedFiltered = entries
-                    let isDefaultSort =
-                        currentSort.count == 1 && currentSort.first?.keyPath == \LogEntry.timestamp
-                        && currentSort.first?.order == .forward
-                    if !isDefaultSort {
-                        LogEntry.fastSort(&sortedFiltered, using: currentSort)
-                    }
-                    return (entries, sortedFiltered)
-                }
+            let hasChannels = !selected.isEmpty && selected.count < totalChannelsCount
+            let hasSearch = !search.isEmpty
 
-                // Spawn parallel worker tasks to process 100k items per thread
-                let finalFiltered = await withTaskGroup(of: [LogEntry].self) { group in
-                    let chunkSize = 100_000
-                    var startIndex = 0
-
-                    while startIndex < entries.count {
-                        let endIndex = min(startIndex + chunkSize, entries.count)
-
-                        // MUST copy these variables to immutable references.
-                        // Otherwise the @Sendable closure captures the mutable reference and all
-                        // tasks evaluate out-of-bounds at the very end of the array.
-                        let taskStart = startIndex
-                        let taskEnd = endIndex
-
-                        group.addTask {
-                            var localFiltered: [LogEntry] = []
-                            localFiltered.reserveCapacity(chunkSize / 10)
-
-                            // Iterate specific ranges so we don't pay the Array Slice overhead
-                            for i in taskStart..<taskEnd {
-                                if Task.isCancelled { return [] }
-                                let entry = entries[i]
-
-                                if checkChannels {
-                                    guard selected.contains(entry.channel) else { continue }
-                                }
-
-                                if checkSearch {
-                                    let match =
-                                        entry.lowerMessage.contains(search)
-                                        || entry.lowerAuthor.contains(search)
-                                    guard match else { continue }
-                                }
-
-                                localFiltered.append(entry)
-                            }
-                            return localFiltered
-                        }
-                        startIndex = endIndex
-                    }
-
-                    var collated: [LogEntry] = []
-                    for await chunkResult in group {
-                        collated.append(contentsOf: chunkResult)
-                    }
-                    return collated
-                }
-
-                var sortedFiltered = finalFiltered
-                let isDefaultSort =
-                    currentSort.count == 1 && currentSort.first?.keyPath == \LogEntry.timestamp
-                    && currentSort.first?.order == .forward
-                if !isDefaultSort {
-                    LogEntry.fastSort(&sortedFiltered, using: currentSort)
-                }
-                return (finalFiltered, sortedFiltered)
-            }.value
-
-            // Assuming we haven't been cancelled by a new keystroke, save findings
-            if !Task.isCancelled {
-                self.filteredEntries = filtered
-                self.displayedEntries = sorted
-                self.isSearching = false
+            // No active filters -> reuse the pre-sorted master array, no scan at all.
+            if !hasChannels && !hasSearch {
+                self.filteredEntries = entries
+                self.displayedEntries = currentSortIsDefault(currentSort)
+                    ? entries : fastSorted(entries, currentSort)
+                return
             }
+
+            var filtered: [LogEntry] = []
+            for entry in entries {
+                if hasChannels && !selected.contains(entry.channel) { continue }
+                if hasSearch && !entry.lowerMessage.contains(search)
+                        && !entry.lowerAuthor.contains(search) { continue }
+                filtered.append(entry)
+            }
+
+            self.filteredEntries = filtered
+            self.displayedEntries = currentSortIsDefault(currentSort)
+                ? filtered : fastSorted(filtered, currentSort)
         }
+    }
+
+    // Helpers (add near the model):
+    private func currentSortIsDefault(_ sort: [KeyPathComparator<LogEntry>]) -> Bool {
+        sort.count == 1 && sort.first?.keyPath == \LogEntry.timestamp
+            && sort.first?.order == .forward
+    }
+    private func fastSorted(_ entries: [LogEntry], _ sort: [KeyPathComparator<LogEntry>]) -> [LogEntry] {
+        var copy = entries
+        LogEntry.fastSort(&copy, using: sort)
+        return copy
     }
 
     /// Bypasses the heavy filter evaluation and only sorts the already-filtered array subset
