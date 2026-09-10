@@ -19,7 +19,7 @@ import UniformTypeIdentifiers
 // MARK: - Extensions for Performance
 
 extension Substring {
-    func trimmingWhitespace() -> Substring {
+    nonisolated func trimmingWhitespace() -> Substring {
         var start = startIndex
         while start < endIndex, self[start].isWhitespace {
             start = index(after: start)
@@ -38,7 +38,7 @@ extension Substring {
 }
 
 extension String {
-    func trimmingWhitespace() -> String {
+    nonisolated func trimmingWhitespace() -> String {
         return String(self[...].trimmingWhitespace())
     }
 }
@@ -624,7 +624,7 @@ struct ResultsTableView: View {
                 copyToClipboard(items)
             }
         }
-        .onCommand(Selector("copy:")) {
+        .onCommand(#selector(NSText.copy(_:))) {
             copyToClipboard(selectedEntries)
         }
         .onChange(of: model.sortOrder) { _, _ in
